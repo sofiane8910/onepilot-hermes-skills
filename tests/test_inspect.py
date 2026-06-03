@@ -91,43 +91,62 @@ def test_unknown_mode_rejected_by_argparse(monkeypatch):
 
 def test_envelope_always_includes_plugin_version(monkeypatch):
     out = _run(["--mode", "inspect", "--name", ""], monkeypatch)
-    assert out["plugin_version"] == "0.1.5"
+    assert out["plugin_version"] == "0.1.6"
 
     out = _run(["--mode", "hub"], monkeypatch)
-    assert out["plugin_version"] == "0.1.5"
+    assert out["plugin_version"] == "0.1.6"
 
 
-# --- source-scoped identifier recovery (0.1.4) ------------------------------
+# --- source-scoped resolution (0.1.4+) --------------------------------------
 #
 # Regression guard for the marketplace bug: a skill shows up in `browse` but
-# `inspect` returns `skill: null`. Cause is that `inspect_skill(name)` re-
-# resolves a bare name through `unified_search`, which skips index-covered
-# external sources, caps results at 20, and dedupes by name. The fix passes
-# the browse row's own `source`; the plugin resolves the exact identifier in
-# that one source and inspects by identifier (the direct fetch path).
+# `inspect` returns `skill: null`. `inspect_skill(name)` re-resolves a bare
+# name through `unified_search`, which skips index-covered external sources,
+# caps results at 20, and dedupes by name. The fix passes the browse row's own
+# `source`; the plugin resolves the skill ENTIRELY within that source
+# (search + fetch on the owning adapter) and never re-enters `inspect_skill`.
+#
+# 0.1.6: critically, the source-scoped path does NOT feed a resolved slug back
+# into `inspect_skill`. Many sources (clawhub/skills.sh/lobehub) use bare-slug
+# identifiers with no `/`, so `inspect_skill` would re-run `_resolve_short_name`
+# on the slug, which matches on the DISPLAY name and misses (slug
+# `airbnb-gateway` vs name `Airbnb Gateway`). See
+# `test_inspect_resolves_clawhub_slug_skill_directly`.
 #
 # These tests stub Hermes (absent in unit env) so the routing logic is
 # exercised deterministically without a live registry fan-out.
 
 
-class _Meta:
-    """SkillMeta-shaped stub: attribute access for name/identifier/source."""
+class _Bundle:
+    """SkillBundle-shaped stub: just a `files` dict (for SKILL.md preview)."""
 
-    def __init__(self, name, identifier, source):
+    def __init__(self, files=None):
+        self.files = files or {}
+
+
+class _Meta:
+    """SkillMeta-shaped stub: attribute access for the fields the resolver
+    reads off a search hit."""
+
+    def __init__(self, name, identifier, source, trust_level="community", description="", tags=None):
         self.name = name
         self.identifier = identifier
         self.source = source
-        self.description = ""
-        self.tags = []
+        self.trust_level = trust_level
+        self.description = description
+        self.tags = tags or []
 
 
 class _Adapter:
-    """SkillSource-shaped stub with a substring `search` over fixed metas."""
+    """SkillSource-shaped stub: substring `search` over fixed metas, plus a
+    `fetch` returning a fixed bundle (keyed by identifier)."""
 
-    def __init__(self, sid, metas):
+    def __init__(self, sid, metas, bundles=None):
         self._sid = sid
         self._metas = metas
+        self._bundles = bundles or {}
         self.searches = 0
+        self.fetches = 0
 
     def source_id(self):
         return self._sid
@@ -137,10 +156,14 @@ class _Adapter:
         q = (query or "").lower()
         return [m for m in self._metas if q in m.name.lower()][:limit]
 
+    def fetch(self, identifier):
+        self.fetches += 1
+        return self._bundles.get(identifier)
+
 
 def _patch_hermes(monkeypatch, *, adapters, inspect_map):
-    """Stub `_import_sources` to yield `adapters` and `_import_hub` so
-    `inspect_skill(lookup)` returns `inspect_map.get(lookup)`."""
+    """Stub `_import_sources` to yield `adapters` and `_import_hub` so the
+    bare-name fallback `inspect_skill(name)` returns `inspect_map.get(name)`."""
     monkeypatch.setattr(hub, "_import_sources",
                         lambda: ((lambda _auth: adapters), object))
     monkeypatch.setattr(hub, "_import_hub",
@@ -158,7 +181,7 @@ def test_inspect_resolves_via_source_when_bare_name_misses(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "PDF Tools", source="github")
+    out = hub.inspect("0.1.6", "PDF Tools", source="github")
     assert out.get("error") is None
     assert out["skill"]["name"] == "PDF Tools"
     assert out["skill"]["identifier"] == "anthropics/skills/pdf"
@@ -175,7 +198,7 @@ def test_inspect_maps_skills_sh_label_to_adapter_id(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "Writer", source="skills.sh")
+    out = hub.inspect("0.1.6", "Writer", source="skills.sh")
     assert out["skill"]["identifier"] == "writer@1.0.0"
 
 
@@ -187,24 +210,44 @@ def test_inspect_all_source_uses_bare_name_only(monkeypatch):
         "identifier": "x/y/pdf", "tags": [],
     }}
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "PDF Tools", source="all")
+    out = hub.inspect("0.1.6", "PDF Tools", source="all")
     assert out["skill"]["name"] == "PDF Tools"
     assert adapters[0].searches == 0
 
 
-def test_inspect_falls_back_to_name_when_identifier_unfetchable(monkeypatch):
-    # Source-scoped identifier is stale; bare name still fetches → no regression.
-    adapters = [_Adapter("github", [_Meta("Ghost", "stale/identifier", "github")])]
-    inspect_map = {
-        "stale/identifier": None,
-        "Ghost": {
-            "name": "Ghost", "description": "", "source": "github",
-            "identifier": "stale/identifier", "tags": [],
-        },
-    }
+def test_inspect_resolves_clawhub_slug_skill_directly(monkeypatch):
+    # The real-world bug: clawhub "Airbnb Gateway" has slug identifier
+    # `airbnb-gateway` (no `/`). Feeding that slug to `inspect_skill` fails
+    # (`_resolve_short_name` matches display name, not slug). The source-scoped
+    # path resolves it directly off the clawhub adapter — so even with
+    # inspect_skill returning None for BOTH the slug and the name, it works.
+    bundle = _Bundle({"SKILL.md": "# Airbnb Gateway\nline2\nline3"})
+    adapters = [_Adapter(
+        "clawhub",
+        [_Meta("Airbnb Gateway", "airbnb-gateway", "clawhub")],
+        bundles={"airbnb-gateway": bundle},
+    )]
+    inspect_map = {"airbnb-gateway": None, "Airbnb Gateway": None}
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "Ghost", source="github")
+    out = hub.inspect("0.1.6", "Airbnb Gateway", source="clawhub")
+    assert out.get("error") is None
+    assert out["skill"] is not None, "clawhub slug skill must resolve, not null"
+    assert out["skill"]["name"] == "Airbnb Gateway"
+    assert out["skill"]["identifier"] == "airbnb-gateway"
+    assert out["skill"]["skillMdPreview"].startswith("# Airbnb Gateway")
+    assert adapters[0].fetches == 1  # preview came from the source's own fetch
+
+
+def test_inspect_returns_detail_even_when_fetch_yields_no_preview(monkeypatch):
+    # Metadata comes from the search hit; the SKILL.md fetch is best-effort.
+    # A fetch miss must still yield the skill (install button needs only the
+    # identifier), just without a preview — never a spurious null.
+    adapters = [_Adapter("github", [_Meta("Ghost", "owner/ghost", "github")])]  # no bundle
+    _patch_hermes(monkeypatch, adapters=adapters, inspect_map={})
+    out = hub.inspect("0.1.6", "Ghost", source="github")
     assert out["skill"]["name"] == "Ghost"
+    assert out["skill"]["identifier"] == "owner/ghost"
+    assert "skillMdPreview" not in out["skill"]
 
 
 def test_inspect_identifier_input_skips_source_search(monkeypatch):
@@ -215,7 +258,7 @@ def test_inspect_identifier_input_skips_source_search(monkeypatch):
         "identifier": "owner/repo/skill", "tags": [],
     }}
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "owner/repo/skill", source="github")
+    out = hub.inspect("0.1.6", "owner/repo/skill", source="github")
     assert out["skill"]["identifier"] == "owner/repo/skill"
     assert adapters[0].searches == 0
 
@@ -232,7 +275,7 @@ def test_inspect_scans_other_sources_when_owning_source_misses(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=[owning, other], inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "Roamer", source="lobehub")
+    out = hub.inspect("0.1.6", "Roamer", source="lobehub")
     assert out["skill"]["identifier"] == "gh/roamer"
 
 
@@ -242,6 +285,6 @@ def test_inspect_skips_centralized_index_in_pass_two(monkeypatch):
     owning = _Adapter("clawhub", [])
     inspect_map = {"Indexed": None}  # nothing fetches → result stays null
     _patch_hermes(monkeypatch, adapters=[index, owning], inspect_map=inspect_map)
-    out = hub.inspect("0.1.5", "Indexed", source="clawhub")
+    out = hub.inspect("0.1.6", "Indexed", source="clawhub")
     assert out["skill"] is None
     assert index.searches == 0

@@ -13,7 +13,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-PLUGIN_VERSION = "0.1.5"
+PLUGIN_VERSION = "0.1.6"
 
 # Path-traversal defense: regex + segment scan in `_validate_name`.
 # We allow `\w` (Unicode-aware: letters/digits/underscore) plus common

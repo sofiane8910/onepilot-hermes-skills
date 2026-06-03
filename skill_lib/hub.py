@@ -19,9 +19,9 @@ def _import_hub():
 
 def _import_sources():
     """Hermes' source-router factory. Same module family `inspect_skill`
-    uses internally — we call it directly only to resolve a browse row's
-    exact identifier inside its own source (see `_resolve_identifier_in_source`).
-    Returns ``(None, None)`` off-host so callers degrade to bare-name inspect.
+    uses internally — we call it directly to resolve a browse row entirely
+    within its own source (see `_source_scoped_detail`). Returns
+    ``(None, None)`` off-host so callers degrade to bare-name inspect.
     """
     try:
         from tools.skills_hub import GitHubAuth, create_source_router
@@ -37,34 +37,83 @@ def _import_sources():
 _SOURCE_LABEL_TO_ID = {"skills.sh": "skills-sh"}
 
 
-def _exact_identifier_from(src: Any, name: str, target_name: str) -> Optional[str]:
-    """Search one source adapter for `name` and return the install identifier
-    of the exact (case-insensitive) name match, or None. Swallows per-source
-    failures so one flaky registry never sinks the whole resolution."""
+def _skill_md_preview(bundle: Any) -> Optional[str]:
+    """First ~50 lines of a bundle's SKILL.md, matching `inspect_skill`'s
+    preview shape. Best-effort: any failure yields no preview, never raises."""
+    try:
+        files = getattr(bundle, "files", None) or {}
+        content = files.get("SKILL.md")
+        if content is None:
+            return None
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        lines = str(content).split("\n")
+        preview = "\n".join(lines[:50])
+        if len(lines) > 50:
+            preview += f"\n\n... ({len(lines) - 50} more lines)"
+        return preview
+    except Exception:
+        return None
+
+
+def _detail_from_result(src: Any, r: Any) -> Optional[dict[str, Any]]:
+    """Build a translate-ready inspect dict from a source search hit `r`,
+    fetching SKILL.md from the SAME adapter for the preview.
+
+    Crucially this does NOT route back through `inspect_skill`: many sources
+    (clawhub, skills.sh, lobehub) use bare-slug identifiers with no ``/``, so
+    `inspect_skill` would re-run `_resolve_short_name` on the slug — which
+    matches on the *display name*, not the slug, and fails (e.g. slug
+    ``airbnb-gateway`` vs name ``Airbnb Gateway``). Resolving on the owning
+    adapter directly skips that lossy round-trip entirely.
+    """
+    ident = getattr(r, "identifier", "") or ""
+    if not ident:
+        return None
+    out: dict[str, Any] = {
+        "name": str(getattr(r, "name", "") or ""),
+        "description": str(getattr(r, "description", "") or ""),
+        "source": str(getattr(r, "source", "") or ""),
+        "trust": str(getattr(r, "trust_level", "community") or "community"),
+        "identifier": ident,
+        "tags": [str(t) for t in (getattr(r, "tags", None) or []) if isinstance(t, (str, int))],
+    }
+    try:
+        preview = _skill_md_preview(src.fetch(ident))
+    except Exception:
+        preview = None
+    if preview:
+        out["skill_md_preview"] = preview
+    return out
+
+
+def _exact_detail_from(src: Any, name: str, target_name: str) -> Optional[dict[str, Any]]:
+    """Search one adapter for `name`; build the full detail off the exact
+    (case-insensitive) name match. Swallows per-source failures."""
     try:
         results = src.search(name, limit=50)
     except Exception:
         return None
     for r in results or []:
         if str(getattr(r, "name", "")).lower() == target_name:
-            ident = getattr(r, "identifier", "") or ""
-            if ident:
-                return ident
+            detail = _detail_from_result(src, r)
+            if detail:
+                return detail
     return None
 
 
-def _resolve_identifier_in_source(name: str, source: str) -> Optional[str]:
-    """Resolve a browse row's exact install identifier within the source the
-    row came from, so `inspect` can hand `inspect_skill` a slash-bearing
-    identifier (its direct fetch path) instead of a bare name.
+def _source_scoped_detail(name: str, source: str) -> Optional[dict[str, Any]]:
+    """Resolve a browse row to its full inspect detail within the source the
+    row came from — search + fetch on the owning adapter, no `inspect_skill`.
 
     Why this exists: `inspect_skill(name)` re-resolves a bare name through
     `unified_search`, which (a) skips the external sources when the
     centralized index is present, (b) caps the merged result at 20, and
-    (c) dedupes by name across sources. Any one of those makes a skill that
-    is plainly visible in `browse_skills` come back `null` on inspect.
-    Searching only the row's own source — directly, never via the index —
-    and lifting the identifier off the exact-name hit sidesteps all three.
+    (c) dedupes by name across sources — so a skill plainly visible in
+    `browse_skills` can come back `null`. And feeding it a resolved *slug*
+    doesn't help: a slug without ``/`` re-enters `_resolve_short_name`, which
+    matches on display name and misses (``airbnb-gateway`` vs ``Airbnb
+    Gateway``). Going straight to the owning adapter sidesteps both.
 
     Returns None (→ caller falls back to bare-name inspect) when there's no
     source hint, the name already looks like an identifier, Hermes is
@@ -97,14 +146,14 @@ def _resolve_identifier_in_source(name: str, source: str) -> Optional[str]:
                 continue
         except Exception:
             continue
-        ident = _exact_identifier_from(src, name, target_name)
-        if ident:
-            return ident
+        detail = _exact_detail_from(src, name, target_name)
+        if detail:
+            return detail
 
     # Pass 2 — owning adapter missed (renamed/unknown label, or the skill now
     # surfaces under a different source). Scan the rest, skipping the index
-    # (the path we're routing around), and take the first exact-name
-    # identifier. Rare, bounded, and never worse than the bare-name fallback.
+    # (the path we're routing around). Rare, bounded, never worse than the
+    # bare-name fallback below it.
     for src in sources:
         try:
             sid = src.source_id()
@@ -112,9 +161,9 @@ def _resolve_identifier_in_source(name: str, source: str) -> Optional[str]:
             continue
         if sid in (want_id, "hermes-index"):
             continue
-        ident = _exact_identifier_from(src, name, target_name)
-        if ident:
-            return ident
+        detail = _exact_detail_from(src, name, target_name)
+        if detail:
+            return detail
     return None
 
 
@@ -313,38 +362,31 @@ def inspect(plugin_version: str, name: str, source: str = "all") -> dict[str, An
             "error": "invalid_name",
         }
 
-    # When the browse row's source is known, resolve the exact identifier in
-    # that source and inspect by identifier (direct fetch path). `source`
-    # defaults to "all"/empty for older callers → resolves to None → bare-name
-    # inspect, identical to the pre-0.1.4 behavior.
-    lookup = name
+    # Primary: when the browse row's source is known, resolve the skill
+    # entirely within that source (search + fetch on the owning adapter). This
+    # handles bare-slug identifiers (clawhub/skills.sh/lobehub) that
+    # `inspect_skill` can't round-trip, and sidesteps `unified_search`'s
+    # index-skip / 20-cap / cross-source name dedupe. `source` defaults to
+    # "all"/empty for older callers → returns None → bare-name fallback below,
+    # identical to the pre-0.1.4 behavior.
     try:
-        ident = _resolve_identifier_in_source(name, source)
+        detail = _source_scoped_detail(name, source)
     except Exception:
-        ident = None
-    if ident:
-        lookup = ident
+        detail = None
+    if detail is not None:
+        return {"plugin_version": plugin_version, "skill": _translate_inspect_skill(detail)}
 
+    # Fallback: bare-name resolution via Hermes' own helper. Handles
+    # source="all"/empty, slash-identifier inputs, and anything the
+    # source-scoped pass didn't surface — never worse than pre-0.1.4.
     try:
-        result = inspect_skill(lookup)
+        result = inspect_skill(name)
     except Exception as e:
         return {
             "plugin_version": plugin_version,
             "skill": None,
             "error": type(e).__name__,
         }
-
-    # Source-scoped identifier didn't fetch a skill → retry the original bare
-    # name so we never regress relative to the pre-0.1.4 path.
-    if result is None and lookup != name:
-        try:
-            result = inspect_skill(name)
-        except Exception as e:
-            return {
-                "plugin_version": plugin_version,
-                "skill": None,
-                "error": type(e).__name__,
-            }
 
     if result is None:
         return {"plugin_version": plugin_version, "skill": None}
