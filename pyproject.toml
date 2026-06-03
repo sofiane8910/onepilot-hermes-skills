@@ -1,6 +1,6 @@
 [project]
 name = "hermes-onepilot-skills"
-version = "0.1.3"
+version = "0.1.4"
 description = "Read-only skill discovery surface for the Onepilot iOS app."
 authors = [{ name = "Onepilot" }]
 license = { text = "MIT" }

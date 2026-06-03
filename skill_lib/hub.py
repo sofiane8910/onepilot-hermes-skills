@@ -17,6 +17,107 @@ def _import_hub():
         return None, None
 
 
+def _import_sources():
+    """Hermes' source-router factory. Same module family `inspect_skill`
+    uses internally — we call it directly only to resolve a browse row's
+    exact identifier inside its own source (see `_resolve_identifier_in_source`).
+    Returns ``(None, None)`` off-host so callers degrade to bare-name inspect.
+    """
+    try:
+        from tools.skills_hub import GitHubAuth, create_source_router
+        return create_source_router, GitHubAuth
+    except ImportError:
+        return None, None
+
+
+# A browse row's `source` label equals the adapter's `source_id()` for every
+# source EXCEPT skills.sh, whose adapter id is "skills-sh" while the row label
+# carries the dotted "skills.sh". Keep this in sync if Hermes adds a source
+# whose display label diverges from its id.
+_SOURCE_LABEL_TO_ID = {"skills.sh": "skills-sh"}
+
+
+def _exact_identifier_from(src: Any, name: str, target_name: str) -> Optional[str]:
+    """Search one source adapter for `name` and return the install identifier
+    of the exact (case-insensitive) name match, or None. Swallows per-source
+    failures so one flaky registry never sinks the whole resolution."""
+    try:
+        results = src.search(name, limit=50)
+    except Exception:
+        return None
+    for r in results or []:
+        if str(getattr(r, "name", "")).lower() == target_name:
+            ident = getattr(r, "identifier", "") or ""
+            if ident:
+                return ident
+    return None
+
+
+def _resolve_identifier_in_source(name: str, source: str) -> Optional[str]:
+    """Resolve a browse row's exact install identifier within the source the
+    row came from, so `inspect` can hand `inspect_skill` a slash-bearing
+    identifier (its direct fetch path) instead of a bare name.
+
+    Why this exists: `inspect_skill(name)` re-resolves a bare name through
+    `unified_search`, which (a) skips the external sources when the
+    centralized index is present, (b) caps the merged result at 20, and
+    (c) dedupes by name across sources. Any one of those makes a skill that
+    is plainly visible in `browse_skills` come back `null` on inspect.
+    Searching only the row's own source — directly, never via the index —
+    and lifting the identifier off the exact-name hit sidesteps all three.
+
+    Returns None (→ caller falls back to bare-name inspect) when there's no
+    source hint, the name already looks like an identifier, Hermes is
+    off-host, or no exact match surfaces.
+    """
+    if not isinstance(name, str) or not name or "/" in name:
+        return None
+    if not isinstance(source, str):
+        return None
+    src_label = source.strip()
+    if not src_label or src_label == "all":
+        return None
+
+    create_source_router, GitHubAuth = _import_sources()
+    if create_source_router is None or GitHubAuth is None:
+        return None
+    try:
+        sources = create_source_router(GitHubAuth())
+    except Exception:
+        return None
+
+    target_name = name.lower()
+    want_id = _SOURCE_LABEL_TO_ID.get(src_label, src_label)
+
+    # Pass 1 — the adapter that owns this row's source. The common path:
+    # one targeted search, no cross-source ambiguity, never touches the index.
+    for src in sources:
+        try:
+            if src.source_id() != want_id:
+                continue
+        except Exception:
+            continue
+        ident = _exact_identifier_from(src, name, target_name)
+        if ident:
+            return ident
+
+    # Pass 2 — owning adapter missed (renamed/unknown label, or the skill now
+    # surfaces under a different source). Scan the rest, skipping the index
+    # (the path we're routing around), and take the first exact-name
+    # identifier. Rare, bounded, and never worse than the bare-name fallback.
+    for src in sources:
+        try:
+            sid = src.source_id()
+        except Exception:
+            continue
+        if sid in (want_id, "hermes-index"):
+            continue
+        ident = _exact_identifier_from(src, name, target_name)
+        if ident:
+            return ident
+    return None
+
+
 def _translate_browse_item(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"name": "", "description": "", "source": "", "trustLevel": "community", "tags": []}
@@ -196,7 +297,7 @@ def browse(
     }
 
 
-def inspect(plugin_version: str, name: str) -> dict[str, Any]:
+def inspect(plugin_version: str, name: str, source: str = "all") -> dict[str, Any]:
     _, inspect_skill = _import_hub()
     if inspect_skill is None:
         return {
@@ -212,14 +313,38 @@ def inspect(plugin_version: str, name: str) -> dict[str, Any]:
             "error": "invalid_name",
         }
 
+    # When the browse row's source is known, resolve the exact identifier in
+    # that source and inspect by identifier (direct fetch path). `source`
+    # defaults to "all"/empty for older callers → resolves to None → bare-name
+    # inspect, identical to the pre-0.1.4 behavior.
+    lookup = name
     try:
-        result = inspect_skill(name)
+        ident = _resolve_identifier_in_source(name, source)
+    except Exception:
+        ident = None
+    if ident:
+        lookup = ident
+
+    try:
+        result = inspect_skill(lookup)
     except Exception as e:
         return {
             "plugin_version": plugin_version,
             "skill": None,
             "error": type(e).__name__,
         }
+
+    # Source-scoped identifier didn't fetch a skill → retry the original bare
+    # name so we never regress relative to the pre-0.1.4 path.
+    if result is None and lookup != name:
+        try:
+            result = inspect_skill(name)
+        except Exception as e:
+            return {
+                "plugin_version": plugin_version,
+                "skill": None,
+                "error": type(e).__name__,
+            }
 
     if result is None:
         return {"plugin_version": plugin_version, "skill": None}

@@ -13,7 +13,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.1.4"
 
 # Path-traversal defense: regex + segment scan in `_validate_name`.
 # We allow `\w` (Unicode-aware: letters/digits/underscore) plus common
@@ -84,7 +84,10 @@ def main(argv: list[str] | None = None) -> int:
             if validated is None:
                 return _emit(_error_envelope("invalid_name", skill=None))
             from skill_lib.hub import inspect
-            return _emit(inspect(plugin_version=PLUGIN_VERSION, name=validated))
+            # `--source` is the browse row's own source label; the plugin uses
+            # it to resolve the exact identifier in that source instead of
+            # re-searching the bare name (which can miss index-covered sources).
+            return _emit(inspect(plugin_version=PLUGIN_VERSION, name=validated, source=args.source))
 
         return _emit(_error_envelope("unknown_mode"))
 
