@@ -91,10 +91,10 @@ def test_unknown_mode_rejected_by_argparse(monkeypatch):
 
 def test_envelope_always_includes_plugin_version(monkeypatch):
     out = _run(["--mode", "inspect", "--name", ""], monkeypatch)
-    assert out["plugin_version"] == "0.1.4"
+    assert out["plugin_version"] == "0.1.5"
 
     out = _run(["--mode", "hub"], monkeypatch)
-    assert out["plugin_version"] == "0.1.4"
+    assert out["plugin_version"] == "0.1.5"
 
 
 # --- source-scoped identifier recovery (0.1.4) ------------------------------
@@ -158,7 +158,7 @@ def test_inspect_resolves_via_source_when_bare_name_misses(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "PDF Tools", source="github")
+    out = hub.inspect("0.1.5", "PDF Tools", source="github")
     assert out.get("error") is None
     assert out["skill"]["name"] == "PDF Tools"
     assert out["skill"]["identifier"] == "anthropics/skills/pdf"
@@ -175,7 +175,7 @@ def test_inspect_maps_skills_sh_label_to_adapter_id(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "Writer", source="skills.sh")
+    out = hub.inspect("0.1.5", "Writer", source="skills.sh")
     assert out["skill"]["identifier"] == "writer@1.0.0"
 
 
@@ -187,7 +187,7 @@ def test_inspect_all_source_uses_bare_name_only(monkeypatch):
         "identifier": "x/y/pdf", "tags": [],
     }}
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "PDF Tools", source="all")
+    out = hub.inspect("0.1.5", "PDF Tools", source="all")
     assert out["skill"]["name"] == "PDF Tools"
     assert adapters[0].searches == 0
 
@@ -203,7 +203,7 @@ def test_inspect_falls_back_to_name_when_identifier_unfetchable(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "Ghost", source="github")
+    out = hub.inspect("0.1.5", "Ghost", source="github")
     assert out["skill"]["name"] == "Ghost"
 
 
@@ -215,7 +215,7 @@ def test_inspect_identifier_input_skips_source_search(monkeypatch):
         "identifier": "owner/repo/skill", "tags": [],
     }}
     _patch_hermes(monkeypatch, adapters=adapters, inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "owner/repo/skill", source="github")
+    out = hub.inspect("0.1.5", "owner/repo/skill", source="github")
     assert out["skill"]["identifier"] == "owner/repo/skill"
     assert adapters[0].searches == 0
 
@@ -232,7 +232,7 @@ def test_inspect_scans_other_sources_when_owning_source_misses(monkeypatch):
         },
     }
     _patch_hermes(monkeypatch, adapters=[owning, other], inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "Roamer", source="lobehub")
+    out = hub.inspect("0.1.5", "Roamer", source="lobehub")
     assert out["skill"]["identifier"] == "gh/roamer"
 
 
@@ -242,6 +242,6 @@ def test_inspect_skips_centralized_index_in_pass_two(monkeypatch):
     owning = _Adapter("clawhub", [])
     inspect_map = {"Indexed": None}  # nothing fetches → result stays null
     _patch_hermes(monkeypatch, adapters=[index, owning], inspect_map=inspect_map)
-    out = hub.inspect("0.1.4", "Indexed", source="clawhub")
+    out = hub.inspect("0.1.5", "Indexed", source="clawhub")
     assert out["skill"] is None
     assert index.searches == 0

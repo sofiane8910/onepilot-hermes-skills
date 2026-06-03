@@ -1,4 +1,4 @@
-# onepilot-skills (Hermes plugin)
+# onepilot-hermes-skills (Hermes plugin)
 
 Read-only skill discovery surface for the [Onepilot](https://onepilotapp.com)
 iOS app. Sits on top of Hermes' built-in `hermes_cli.skills_hub` helpers
@@ -35,17 +35,17 @@ plugin is intentionally separate so:
 ## Install
 
 ```sh
-hermes plugins install https://github.com/onepilotapp/onepilot-skills
+hermes plugins install https://github.com/sofiane8910/onepilot-hermes-skills
 ```
 
-Lives at `~/.hermes/plugins/onepilot-skills/` after install. The Onepilot
+Lives at `~/.hermes/plugins/onepilot-hermes-skills/` after install. The Onepilot
 iOS app probes for the script and offers a one-tap install when it isn't
 present.
 
 ## Usage
 
 ```
-python3 ~/.hermes/plugins/onepilot-skills/skills_dump.py --mode <mode> [args]
+python3 ~/.hermes/plugins/onepilot-hermes-skills/skills_dump.py --mode <mode> [args]
 ```
 
 Modes:
@@ -67,7 +67,7 @@ own (Hermes' helpers may; that's their boundary, not ours). It writes
 zero files. It reads only `~/.hermes/{skills,profiles,config.yaml}` and
 the `HERMES_HOME` env var. It executes no subprocesses.
 
-`ci/plugin/onepilot-skills/security-check.sh` (in the Onepilot repo)
+`ci/plugin/onepilot-hermes-skills/security-check.sh` (in the Onepilot repo)
 greps the source tree on every CI run and fails on any of:
 `import requests/httpx/urllib/socket/subprocess`, `os.system`,
 `shell=True`, or any non-`HERMES_HOME` `os.environ[...]` access. See
@@ -88,7 +88,7 @@ The rule: a contributor browsing GitHub at any commit on `main` should see the s
 ## Development
 
 ```
-cd onepilotapp/plugins/hermes/onepilot-skills
+cd onepilotapp/plugins/hermes/onepilot-hermes-skills
 pytest tests/
 ```
 

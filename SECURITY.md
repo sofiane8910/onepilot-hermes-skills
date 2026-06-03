@@ -1,4 +1,4 @@
-# Security model — `onepilot-skills`
+# Security model — `onepilot-hermes-skills`
 
 ## What this plugin defends against
 
@@ -24,7 +24,7 @@
 
 ## Hard invariants
 
-These are **enforced by code review and CI** (`ci/plugin/onepilot-skills/security-check.sh`).
+These are **enforced by code review and CI** (`ci/plugin/onepilot-hermes-skills/security-check.sh`).
 A single hit fails the build:
 
 - 🚫 `import requests`
