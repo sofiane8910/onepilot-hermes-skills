@@ -30,6 +30,25 @@ def _import_sources():
         return None, None
 
 
+def _import_parallel():
+    """Hermes' parallel source fan-out with a per-call overall timeout.
+
+    Returns ``(parallel_search_sources, create_source_router, GitHubAuth)``
+    or ``(None, None, None)`` when unavailable (off-host, or a Hermes
+    build old enough to predate `parallel_search_sources`) so callers fall
+    back to the sequential `browse_skills` path.
+    """
+    try:
+        from tools.skills_hub import (
+            GitHubAuth,
+            create_source_router,
+            parallel_search_sources,
+        )
+        return parallel_search_sources, create_source_router, GitHubAuth
+    except ImportError:
+        return None, None, None
+
+
 # A browse row's `source` label equals the adapter's `source_id()` for every
 # source EXCEPT skills.sh, whose adapter id is "skills-sh" while the row label
 # carries the dotted "skills.sh". Keep this in sync if Hermes adds a source
@@ -224,7 +243,81 @@ def _matches_query(item: dict[str, Any], q_lower: str) -> bool:
 # per registry; pulling 10 pages × 100 = 1000 skills is plenty for any
 # realistic query and keeps the rate-limit footprint bounded.
 # Upstream's own disk index cache (1h TTL) makes repeats free.
+# Only the legacy fallback path (no `parallel_search_sources`) uses this.
 _MAX_AGGREGATE_PAGES = 10
+
+# Trust ranking + per-source caps, mirroring Hermes' own `browse_skills`
+# so the resilient path produces an identical catalog ordering.
+_TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
+_PER_SOURCE_LIMIT = {
+    "official": 100, "skills-sh": 100, "well-known": 25, "github": 100,
+    "clawhub": 50, "claude-marketplace": 50, "lobehub": 50,
+}
+
+# Wall-clock bound on the whole multi-registry fan-out. A slow or dead
+# registry is dropped (returned in `timed_out`) rather than blocking the
+# others — partial results beat an infinite spinner. Sources that miss
+# this window surface on the next page load once their own cache warms.
+_BROWSE_TIMEOUT_SECONDS = 20
+
+
+def _translate_meta(r: Any) -> dict[str, Any]:
+    """`SkillMeta` (from `parallel_search_sources`) → iOS-canonical dict.
+
+    Same output shape as `_translate_browse_item`, but reads object
+    attributes instead of dict keys.
+    """
+    tags_raw = getattr(r, "tags", None) or []
+    return {
+        "name": str(getattr(r, "name", "") or ""),
+        "description": str(getattr(r, "description", "") or ""),
+        "source": str(getattr(r, "source", "") or ""),
+        "trustLevel": str(getattr(r, "trust_level", "community") or "community"),
+        "tags": [str(t) for t in tags_raw if isinstance(t, (str, int))],
+    }
+
+
+def _resilient_catalog(source: str) -> Optional[list[dict[str, Any]]]:
+    """Full deduped catalog via Hermes' parallel, timeout-bounded fan-out.
+
+    Returns the translated catalog (every page, alphabetical within trust
+    tiers) so the caller can slice/filter in memory. Returns ``None`` when
+    `parallel_search_sources` isn't importable — the caller then falls
+    back to the sequential `browse_skills` path. Slow registries are
+    skipped, never awaited to completion, so this cannot hang the way a
+    bare `browse_skills` call can.
+    """
+    parallel_search_sources, create_source_router, GitHubAuth = _import_parallel()
+    if parallel_search_sources is None or create_source_router is None or GitHubAuth is None:
+        return None
+
+    sources = create_source_router(GitHubAuth())
+    all_results, _counts, _timed_out = parallel_search_sources(
+        sources,
+        query="",
+        per_source_limits=_PER_SOURCE_LIMIT,
+        source_filter=source,
+        overall_timeout=_BROWSE_TIMEOUT_SECONDS,
+    )
+
+    # Dedup by name; higher trust tier wins ties (mirrors browse_skills).
+    seen: dict[str, Any] = {}
+    for r in all_results:
+        name = getattr(r, "name", "") or ""
+        if not name:
+            continue
+        rank = _TRUST_RANK.get(getattr(r, "trust_level", ""), 0)
+        prev = seen.get(name)
+        if prev is None or rank > _TRUST_RANK.get(getattr(prev, "trust_level", ""), 0):
+            seen[name] = r
+
+    deduped = list(seen.values())
+    deduped.sort(key=lambda r: (
+        -_TRUST_RANK.get(getattr(r, "trust_level", ""), 0),
+        (getattr(r, "source", "") or "") != "official",
+        (getattr(r, "name", "") or "").lower(),
+    ))
+    return [_translate_meta(r) for r in deduped]
 
 
 def browse(
@@ -234,6 +327,48 @@ def browse(
     source: str = "all",
     query: str = "",
 ) -> dict[str, Any]:
+    page = max(1, min(int(page), 1000))
+    page_size = max(1, min(int(page_size), 100))
+    if not isinstance(source, str) or len(source) > 32:
+        source = "all"
+    if not isinstance(query, str):
+        query = ""
+    query = query.strip()[:128]  # length clamp; argparse already capped via shellQuote
+
+    # Preferred path: Hermes' parallel, timeout-bounded fan-out. Fetches
+    # the whole catalog once (partial on slow registries), then slices /
+    # filters in memory. This is what stops the marketplace hanging when
+    # one federated registry is unreachable. Falls through to the legacy
+    # `browse_skills` path below when the helper isn't available.
+    try:
+        catalog = _resilient_catalog(source)
+    except Exception as e:
+        return {
+            "plugin_version": plugin_version,
+            "items": [],
+            "page": page,
+            "total_pages": 1,
+            "total": 0,
+            "error": type(e).__name__,
+        }
+    if catalog is not None:
+        if query:
+            q_lower = query.lower()
+            catalog = [it for it in catalog if _matches_query(it, q_lower)]
+        total = len(catalog)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+        start = (page - 1) * page_size
+        return {
+            "plugin_version": plugin_version,
+            "items": catalog[start : start + page_size],
+            "page": page,
+            "total_pages": total_pages,
+            "total": total,
+        }
+
+    # ---- Legacy fallback (Hermes without `parallel_search_sources`) ----
     browse_skills, _ = _import_hub()
     if browse_skills is None:
         return {
@@ -244,15 +379,6 @@ def browse(
             "total": 0,
             "error": "hermes_unavailable",
         }
-
-    page = max(1, min(int(page), 1000))
-    page_size = max(1, min(int(page_size), 100))
-    if not isinstance(source, str) or len(source) > 32:
-        source = "all"
-    if not isinstance(query, str):
-        query = ""
-    query = query.strip()[:128]  # length clamp; argparse already capped via shellQuote
-
     # Query-less path: defer to upstream pagination unchanged. This is
     # the hot path (every cold marketplace open) so we keep it cheap.
     if not query:

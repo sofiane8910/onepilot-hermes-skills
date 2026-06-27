@@ -25,10 +25,55 @@ def _stub_hermes_module(browse_impl=None, inspect_impl=None):
     sys.modules["hermes_cli.skills_hub"] = skills_hub
 
 
+def _stub_tools_module(results, timed_out=None, on_call=None):
+    """Stub `tools.skills_hub.parallel_search_sources` (+ router/auth) so the
+    resilient browse path engages without a real Hermes host."""
+    tools = types.ModuleType("tools")
+    skills_hub = types.ModuleType("tools.skills_hub")
+
+    class GitHubAuth:
+        def __init__(self, *a, **k):
+            pass
+
+    def create_source_router(auth=None):
+        return ["<opaque-source>"]
+
+    def parallel_search_sources(sources, query="", per_source_limits=None,
+                                source_filter="all", overall_timeout=30,
+                                on_source_done=None):
+        if on_call is not None:
+            on_call({
+                "query": query,
+                "per_source_limits": per_source_limits,
+                "source_filter": source_filter,
+                "overall_timeout": overall_timeout,
+            })
+        return (results, {}, timed_out or [])
+
+    skills_hub.GitHubAuth = GitHubAuth
+    skills_hub.create_source_router = create_source_router
+    skills_hub.parallel_search_sources = parallel_search_sources
+    tools.skills_hub = skills_hub
+    sys.modules["tools"] = tools
+    sys.modules["tools.skills_hub"] = skills_hub
+
+
+class _Meta:
+    """Minimal `SkillMeta` stand-in (attribute access, not dict)."""
+
+    def __init__(self, name, description="", source="clawhub",
+                 trust_level="community", tags=None):
+        self.name = name
+        self.description = description
+        self.source = source
+        self.trust_level = trust_level
+        self.tags = tags or []
+
+
 @pytest.fixture(autouse=True)
 def cleanup_hermes_modules():
     yield
-    for k in ("hermes_cli", "hermes_cli.skills_hub"):
+    for k in ("hermes_cli", "hermes_cli.skills_hub", "tools", "tools.skills_hub"):
         sys.modules.pop(k, None)
 
 
@@ -197,6 +242,120 @@ def test_browse_query_paginates_filtered_results():
     assert page1["total_pages"] == 2
     assert len(page1["items"]) == 10
     assert len(page2["items"]) == 5
+
+
+def test_resilient_path_used_when_parallel_available_and_translates():
+    """When `parallel_search_sources` is importable, browse uses it and
+    never touches the hang-prone sequential `browse_skills`."""
+    def browse_must_not_run(page, page_size, source):
+        raise AssertionError("browse_skills must not be called on resilient path")
+
+    _stub_hermes_module(browse_impl=browse_must_not_run)
+    _stub_tools_module(results=[
+        _Meta("writer", "Drafts", source="official", trust_level="builtin"),
+        _Meta("researcher", "Search", source="clawhub", trust_level="community", tags=["agent"]),
+    ])
+
+    out = hub_mod.browse(plugin_version="0.1.0", page=1, page_size=50, source="all")
+    assert out["total"] == 2
+    item = out["items"][0]
+    assert "trust" not in item
+    # official + builtin sorts first.
+    assert item["name"] == "writer"
+    assert item["trustLevel"] == "builtin"
+    assert out["items"][1]["tags"] == ["agent"]
+
+
+def test_resilient_returns_partial_results_when_a_source_times_out():
+    """A timed-out registry is dropped, not fatal — surviving results
+    still populate the marketplace instead of hanging or erroring."""
+    _stub_hermes_module()
+    _stub_tools_module(
+        results=[_Meta("calendar", "CalDAV")],
+        timed_out=["github", "lobehub"],
+    )
+    out = hub_mod.browse(plugin_version="0.1.0")
+    assert "error" not in out
+    assert out["total"] == 1
+    assert out["items"][0]["name"] == "calendar"
+
+
+def test_resilient_dedupes_by_trust_rank():
+    """Same skill name from two sources collapses to the higher trust tier."""
+    _stub_hermes_module()
+    _stub_tools_module(results=[
+        _Meta("notes", "community copy", source="clawhub", trust_level="community"),
+        _Meta("notes", "official copy", source="official", trust_level="builtin"),
+    ])
+    out = hub_mod.browse(plugin_version="0.1.0")
+    assert out["total"] == 1
+    assert out["items"][0]["trustLevel"] == "builtin"
+    assert out["items"][0]["description"] == "official copy"
+
+
+def test_resilient_filters_by_query():
+    _stub_hermes_module()
+    _stub_tools_module(results=[
+        _Meta("calendar", "x"),
+        _Meta("writer", "y"),
+        _Meta("skill-x", "z", tags=["Calendar"]),
+    ])
+    out = hub_mod.browse(plugin_version="0.1.0", query="CALENDAR")
+    names = {it["name"] for it in out["items"]}
+    assert names == {"calendar", "skill-x"}  # name + tag, case-insensitive
+
+
+def test_resilient_paginates_in_memory():
+    _stub_hermes_module()
+    _stub_tools_module(results=[_Meta(f"s-{i:02d}") for i in range(15)])
+    page1 = hub_mod.browse(plugin_version="0.1.0", page=1, page_size=10)
+    page2 = hub_mod.browse(plugin_version="0.1.0", page=2, page_size=10)
+    assert page1["total"] == 15 and page1["total_pages"] == 2
+    assert len(page1["items"]) == 10
+    assert len(page2["items"]) == 5
+
+
+def test_resilient_passes_timeout_and_source_filter():
+    captured = {}
+    _stub_hermes_module()
+    _stub_tools_module(results=[], on_call=lambda kw: captured.update(kw))
+    hub_mod.browse(plugin_version="0.1.0", source="clawhub")
+    assert captured["overall_timeout"] == hub_mod._BROWSE_TIMEOUT_SECONDS
+    assert captured["source_filter"] == "clawhub"
+    assert captured["query"] == ""  # browse fan-out always empty-query
+
+
+def test_resilient_surfaces_clean_error_on_unexpected_failure():
+    """A genuine fault in the parallel path returns a class-name envelope,
+    not a traceback, and does NOT silently fall back to browse_skills."""
+    def boom(page, page_size, source):
+        raise AssertionError("must not reach browse_skills")
+
+    _stub_hermes_module(browse_impl=boom)
+
+    tools = types.ModuleType("tools")
+    skills_hub = types.ModuleType("tools.skills_hub")
+
+    class GitHubAuth:
+        def __init__(self, *a, **k):
+            pass
+
+    def create_source_router(auth=None):
+        raise RuntimeError("router secret /path/leak")
+
+    def parallel_search_sources(*a, **k):
+        return ([], {}, [])
+
+    skills_hub.GitHubAuth = GitHubAuth
+    skills_hub.create_source_router = create_source_router
+    skills_hub.parallel_search_sources = parallel_search_sources
+    tools.skills_hub = skills_hub
+    sys.modules["tools"] = tools
+    sys.modules["tools.skills_hub"] = skills_hub
+
+    out = hub_mod.browse(plugin_version="0.1.0")
+    assert out["error"] == "RuntimeError"
+    assert "/path/leak" not in str(out)
 
 
 def test_inspect_translates_hermes_names_to_ios_canonical():
